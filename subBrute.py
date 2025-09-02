@@ -8,15 +8,19 @@ import sys
 import time
 
 # Função que será executada por cada thread
-def worker(target_domain, record_type, work_queue, found_subdomains):
+def worker(target_domain, record_type, work_queue, found_subdomains, shutdown_event):
     """
-    Função worker que pega subdomínios da fila, resolve o DNS e armazena os resultados.
+    Função worker que pega subdomínios da fila, resolve o DNS e armazena os resultados, como também sinaliza o evento de desligamento (Ctrl + C).
     """
-    # Cria uma instância do resolver para esta thread
     resolver = dns.resolver.Resolver()
     
-    while not work_queue.empty():
+    # ALTERADO: O loop agora também verifica o evento de desligamento
+    while not work_queue.empty() and not shutdown_event.is_set():
         try:
+            # NOVO: Verifica o evento antes de pegar um novo item
+            if shutdown_event.is_set():
+                break
+
             subdomain = work_queue.get_nowait()
             full_domain = f"{subdomain}.{target_domain}"
             
@@ -28,18 +32,16 @@ def worker(target_domain, record_type, work_queue, found_subdomains):
             print(f"\033[94m\033[1m[+] {full_domain} -> {ips}\033[m")
             found_subdomains.append(full_domain)
 
+        except queue.Empty:
+            # A fila pode esvaziar enquanto o loop está rodando, então apenas continue
+            continue
         except dns.resolver.NXDOMAIN:
-            # O subdomínio não existe, que é o esperado na maioria das vezes. Ignora.
             pass
         except dns.resolver.NoAnswer:
-            # Existe o domínio, mas não para o tipo de registro (ex: 'A') solicitado.
             pass
         except dns.resolver.Timeout:
-            # A consulta demorou demais para responder.
             print(f"\033[91m[!] Timeout ao consultar: {full_domain}\033[m", file=sys.stderr)
         except Exception as e:
-            # Captura outras exceções de DNS ou da fila.
-            # print(f"\033[91m[!] Ocorreu um erro: {e}\033[m", file=sys.stderr)
             pass
         finally:
             work_queue.task_done()
@@ -82,7 +84,7 @@ def main():
     required_args.add_argument("-d", "--dominio", required=True, help="O domínio alvo para a busca.")
     required_args.add_argument("-w", "--wordlist", required=True, help="Caminho para o arquivo da wordlist.")
     
-    # Argumentos opcionais (aqui incluímos nossa ajuda personalizada)
+    # Argumentos opcionais (ajuda personalizada)
     optional_args = parser.add_argument_group('Argumentos opcionais')
     optional_args.add_argument("-t", "--threads", type=int, default=10, help="Número de threads para usar (padrão: 10).")
     optional_args.add_argument("-r", "--record", type=str, default="A", help="Tipo de registro DNS para consultar (padrão: A).")
@@ -116,23 +118,28 @@ def main():
         
     found_subdomains = []
     threads = []
+    
+    shutdown_event = threading.Event()
 
     # --- Criação e Inicialização das Threads ---
     for _ in range(args.threads):
-        thread = threading.Thread(target=worker, args=(args.dominio, args.record, work_queue, found_subdomains))
-        thread.daemon = True # Permite que o programa principal saia mesmo se as threads estiverem rodando
+        thread = threading.Thread(target=worker, args=(args.dominio, args.record, work_queue, found_subdomains, shutdown_event))
+        thread.daemon = True
         thread.start()
         threads.append(thread)
 
-    # Espera a fila esvaziar
-    work_queue.join()
+    # Envolve o join em um try/except para capturar o Ctrl+C (Parar o programa)
+    try:
+        work_queue.join()
+    except KeyboardInterrupt:
+        print("\n\033[93m[!] Interrupção detectada. Sinalizando para as threads pararem...\033[m")
+        shutdown_event.set() # Levanta a "bandeira" para todas as threads
 
     # --- Finalização ---
     end_time = time.time()
     print("\n" + '\033[93m' + "-----------------------------------------" + '\033[m')
     print(f"\033[92mBusca finalizada em {end_time - start_time:.2f} segundos.\033[m")
     print(f"\033[92mTotal de {len(found_subdomains)} subdomínios encontrados.\033[m")
-
 
 if __name__ == "__main__":
     # Garante que o dnspython está instalado
